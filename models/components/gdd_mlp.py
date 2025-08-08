@@ -46,6 +46,66 @@ class GDDMLPModule(nn.Module):
         # Sigmoid激活函数
         self.sigmoid = nn.Sigmoid()
 
+    # def forward(self, x: torch.Tensor) -> torch.Tensor:
+    #     """
+    #     前向传播：通道交互与特征优化
+    #
+    #     Args:
+    #         x: 输入张量 [Batch, Num_patches, Patch_len, Channels]
+    #
+    #     Returns:
+    #         output: 经过通道交互优化的张量 [Batch, Num_patches, Patch_len, Channels]
+    #     """
+    #     b, n, p, d = x.shape  # batch, num_patches, patch_len, channels
+    #
+    #     # 初始化scale和shift修正项
+    #     scale = torch.zeros_like(x)
+    #     shift = torch.zeros_like(x)
+    #
+    #     # 平均池化分支
+    #     if self.avg_flag and self.avg_pool is not None:
+    #         # 重塑为 [b*n, p, d]
+    #         x_reshaped = x.reshape(b * n, p, d)
+    #         # 池化得到 [b*n, 1, d]
+    #         pooled_avg = self.avg_pool(x_reshaped)
+    #         # 重塑为 [b, n, d]
+    #         pooled_avg = pooled_avg.reshape(b, n, d)
+    #         # 转置为 [b, d, n] 用于MLP处理
+    #         pooled_avg = pooled_avg.permute(0, 2, 1)
+    #
+    #         # MLP处理: [b, d, n]
+    #         scale_contrib = self.fc_scale(pooled_avg)
+    #         shift_contrib = self.fc_shift(pooled_avg)
+    #
+    #         # 转回原始维度: [b, d, n] -> [b, n, 1, d]
+    #         scale_contrib = scale_contrib.permute(0, 2, 1).unsqueeze(2)
+    #         shift_contrib = shift_contrib.permute(0, 2, 1).unsqueeze(2)
+    #
+    #         scale += scale_contrib
+    #         shift += shift_contrib
+    #
+    #     # 最大池化分支
+    #     if self.max_flag and self.max_pool is not None:
+    #         # 与平均池化类似的处理流程
+    #         x_reshaped = x.reshape(b * n, p, d)
+    #         pooled_max = self.max_pool(x_reshaped)
+    #         pooled_max = pooled_max.reshape(b, n, d)
+    #         pooled_max = pooled_max.permute(0, 2, 1)
+    #
+    #         scale_contrib = self.fc_scale(pooled_max)
+    #         shift_contrib = self.fc_shift(pooled_max)
+    #
+    #         scale_contrib = scale_contrib.permute(0, 2, 1).unsqueeze(2)
+    #         shift_contrib = shift_contrib.permute(0, 2, 1).unsqueeze(2)
+    #
+    #         scale += scale_contrib
+    #         shift += shift_contrib
+    #
+    #     # 应用sigmoid激活并进行残差连接
+    #     output = self.sigmoid(scale) * x + self.sigmoid(shift)
+    #
+    #     return output
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         前向传播：通道交互与特征优化
@@ -59,49 +119,41 @@ class GDDMLPModule(nn.Module):
         b, n, p, d = x.shape  # batch, num_patches, patch_len, channels
 
         # 初始化scale和shift修正项
-        scale = torch.zeros_like(x)
-        shift = torch.zeros_like(x)
+        scale = torch.zeros((b, n, 1, d), device=x.device)  # 修正初始化形状以匹配广播
+        shift = torch.zeros((b, n, 1, d), device=x.device)  # 修正初始化形状以匹配广播
+
+        pooled_features = []
+
+        # 统一处理输入以适应Pool1d
+        # 原始: [b, n, p, d] -> permute -> [b, n, d, p] -> reshape -> [b*n, d, p]
+        x_for_pool = x.permute(0, 1, 3, 2).reshape(b * n, d, p)
 
         # 平均池化分支
         if self.avg_flag and self.avg_pool is not None:
-            # 重塑为 [b*n, p, d]
-            x_reshaped = x.reshape(b * n, p, d)
-            # 池化得到 [b*n, 1, d]
-            pooled_avg = self.avg_pool(x_reshaped)
-            # 重塑为 [b, n, d]
-            pooled_avg = pooled_avg.reshape(b, n, d)
-            # 转置为 [b, d, n] 用于MLP处理
-            pooled_avg = pooled_avg.permute(0, 2, 1)
-
-            # MLP处理: [b, d, n]
-            scale_contrib = self.fc_scale(pooled_avg)
-            shift_contrib = self.fc_shift(pooled_avg)
-
-            # 转回原始维度: [b, d, n] -> [b, n, 1, d]
-            scale_contrib = scale_contrib.permute(0, 2, 1).unsqueeze(2)
-            shift_contrib = shift_contrib.permute(0, 2, 1).unsqueeze(2)
-
-            scale += scale_contrib
-            shift += shift_contrib
+            # 在 patch_len (p) 维度上池化: [b*n, d, p] -> [b*n, d, 1]
+            pooled_avg = self.avg_pool(x_for_pool).squeeze(-1)  # -> [b*n, d]
+            pooled_features.append(pooled_avg)
 
         # 最大池化分支
         if self.max_flag and self.max_pool is not None:
-            # 与平均池化类似的处理流程
-            x_reshaped = x.reshape(b * n, p, d)
-            pooled_max = self.max_pool(x_reshaped)
-            pooled_max = pooled_max.reshape(b, n, d)
-            pooled_max = pooled_max.permute(0, 2, 1)
+            # 在 patch_len (p) 维度上池化: [b*n, d, p] -> [b*n, d, 1]
+            pooled_max = self.max_pool(x_for_pool).squeeze(-1)  # -> [b*n, d]
+            pooled_features.append(pooled_max)
 
-            scale_contrib = self.fc_scale(pooled_max)
-            shift_contrib = self.fc_shift(pooled_max)
+        for pooled in pooled_features:
+            # 重塑以适应MLP: [b*n, d] -> [b, n, d]
+            pooled = pooled.reshape(b, n, d)
 
-            scale_contrib = scale_contrib.permute(0, 2, 1).unsqueeze(2)
-            shift_contrib = shift_contrib.permute(0, 2, 1).unsqueeze(2)
+            # MLP处理，现在fc层直接在最后一个维度(d)上操作
+            scale_contrib = self.fc_scale(pooled)  # -> [b, n, d]
+            shift_contrib = self.fc_shift(pooled)  # -> [b, n, d]
 
-            scale += scale_contrib
-            shift += shift_contrib
+            # 增加一个维度以进行广播: [b, n, d] -> [b, n, 1, d]
+            scale += scale_contrib.unsqueeze(2)
+            shift += shift_contrib.unsqueeze(2)
 
         # 应用sigmoid激活并进行残差连接
+        # (sigmoid(scale)的[b, n, 1, d])与x的[b, n, p, d]进行广播相乘
         output = self.sigmoid(scale) * x + self.sigmoid(shift)
 
         return output
