@@ -28,7 +28,7 @@ def main(args):
     # 设置随机种子
     set_seed(args.seed)
 
-    # 在模型创建前添加
+    # 在模型创建前添加 (保留您之前的调试代码)
     print("=== 数据加载调试 ===")
     data_loader = CustomDataLoader(
         args.data,
@@ -38,17 +38,13 @@ def main(args):
         args.feature_type,
         args.target,
     )
-
     print(f"数据路径: {args.data}")
     print(f"特征数量: {data_loader.n_feature}")
-
-    # 检查实际数据形状
     train_data = data_loader.get_train()
     for batch_x, batch_y in train_data:
         print(f"原始输入形状: {batch_x.shape}")
         print(f"原始输出形状: {batch_y.shape}")
         break
-
     print("=== 模型创建调试 ===")
     model = PAHyperLinear(
         input_shape=(args.seq_len, data_loader.n_feature),
@@ -59,35 +55,11 @@ def main(args):
         gdd_reduction=args.gdd_reduction,
         target_slice=data_loader.target_slice,
     ).to(device)
-
     print(f"模型期望输入: {model.seq_len} x {model.n_features}")
 
-
-
-    # 加载数据集
-    data_loader = CustomDataLoader(
-        args.data,
-        args.batch_size,
-        args.seq_len,
-        args.pred_len,
-        args.feature_type,
-        args.target,
-    )
-
-    train_data = data_loader.get_train()
+    # 重新获取数据加载器实例，以供训练使用
     val_data = data_loader.get_val()
     test_data = data_loader.get_test()
-
-    # 创建PA-HyperLinear模型
-    model = PAHyperLinear(
-        input_shape=(args.seq_len, data_loader.n_feature),
-        pred_len=args.pred_len,
-        k_periods=args.k_periods,
-        d_model=args.d_model,
-        dropout=args.dropout,
-        gdd_reduction=args.gdd_reduction,
-        target_slice=data_loader.target_slice,
-    ).to(device)
 
     # 打印模型参数量
     print(f"模型总参数量: {sum(p.numel() for p in model.parameters()):,}")
@@ -97,29 +69,23 @@ def main(args):
     criterion = torch.nn.MSELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate, weight_decay=1e-9)
 
-    best_loss = torch.tensor(float('inf'))
+    # --- 早停机制初始化 ---
+    best_loss = float('inf')
+    patience_counter = 0
+    # -----------------------
 
     # 创建检查点目录
     save_directory = os.path.join(args.checkpoint_dir, args.name)
-    if os.path.exists(save_directory):
-        import glob
-        import re
-
-        path = Path(save_directory)
-        dirs = glob.glob(f"{path}*")  # 相似路径
-        matches = [re.search(rf"%s(\d+)" % path.stem, d) for d in dirs]
-        i = [int(m.groups()[0]) for m in matches if m]  # 索引
-        n = max(i) + 1 if i else 2  # 递增数字
-        save_directory = f"{path}{n}"  # 更新路径
-
-    os.makedirs(save_directory)
+    if not os.path.exists(save_directory):
+        os.makedirs(save_directory)
+    best_model_path = os.path.join(save_directory, "best.pt")
 
     # 开始训练
     for epoch in range(args.train_epochs):
         model.train()
         train_mloss = torch.zeros(1, device=device)
         iter_time = 0
-        print(f"轮次: {epoch + 1}")
+        print(f"轮次: {epoch + 1}/{args.train_epochs}")
         print("训练中...")
         pbar = tqdm(enumerate(train_data), total=len(train_data))
 
@@ -127,14 +93,10 @@ def main(args):
             batch_x, batch_y = batch_x.to(device), batch_y.to(device)
             start_time = time.time()
 
-            # 前向传播
             outputs, aux_loss = model(batch_x)
-
-            # 计算总损失
             main_loss = criterion(outputs, batch_y)
             total_loss = main_loss + aux_loss
 
-            # 反向传播
             optimizer.zero_grad()
             total_loss.backward()
             optimizer.step()
@@ -153,10 +115,10 @@ def main(args):
         val_mae = torch.zeros(1, device=device)
         val_mse = torch.zeros(1, device=device)
         print("验证中...")
-        pbar = tqdm(enumerate(val_data), total=len(val_data))
+        pbar_val = tqdm(enumerate(val_data), total=len(val_data))
 
         with torch.no_grad():
-            for i, (batch_x, batch_y) in pbar:
+            for i, (batch_x, batch_y) in pbar_val:
                 batch_x, batch_y = batch_x.to(device), batch_y.to(device)
                 outputs, aux_loss = model(batch_x)
                 loss = criterion(outputs, batch_y)
@@ -165,23 +127,34 @@ def main(args):
                 val_mae = (val_mae * i + mae.detach()) / (i + 1)
                 mse = ((outputs - batch_y) ** 2).mean()
                 val_mse = (val_mse * i + mse.detach()) / (i + 1)
-                pbar.set_description(('%-10s' * 1 + '%-10.8g' * 1) % ('', val_mloss))
-
-            # 保存最佳模型
-            if val_mloss < best_loss or epoch == args.train_epochs - 1:
-                best_loss = val_mloss
-                best_model = deepcopy(model.state_dict())
-                torch.save(best_model, os.path.join(save_directory, "best.pt"))
+                pbar_val.set_description(('%-10s' * 1 + '%-10.8g' * 1) % ('', val_mloss))
 
         print(f"验证损失: {val_mloss.item()}, 验证MSE: {val_mse.item()}, 验证MAE: {val_mae.item()}")
 
-        # 打印模型信息 (仅第一轮)
+        # --- 早停逻辑判断 ---
+        current_loss = val_mloss.item()
+        if current_loss < best_loss:
+            best_loss = current_loss
+            patience_counter = 0
+            print(f"发现更好的模型，在轮次 {epoch + 1} 保存。")
+            torch.save(model.state_dict(), best_model_path)
+        else:
+            patience_counter += 1
+            print(f"验证损失未改善。早停计数: {patience_counter}/{args.patience}")
+
+        if patience_counter >= args.patience:
+            print(f"早停触发！在轮次 {epoch + 1} 停止训练。")
+            break
+        # ---------------------
+
         if epoch == 0:
             model_info = model.get_model_info()
             print(f"检测到的周期: {model_info.get('detected_periods', 'N/A')}")
 
+    print("\n训练结束。")
     # 加载最佳模型
-    model.load_state_dict(best_model)
+    print(f"加载在验证集上表现最佳的模型进行测试: {best_model_path}")
+    model.load_state_dict(torch.load(best_model_path))
 
     # 开始测试
     model.eval()
@@ -190,10 +163,10 @@ def main(args):
     test_mse = torch.zeros(1, device=device)
 
     print("最终测试中...")
-    pbar = tqdm(enumerate(test_data), total=len(test_data))
+    pbar_test = tqdm(enumerate(test_data), total=len(test_data))
 
     with torch.no_grad():
-        for i, (batch_x, batch_y) in pbar:
+        for i, (batch_x, batch_y) in pbar_test:
             batch_x, batch_y = batch_x.to(device), batch_y.to(device)
             outputs, aux_loss = model(batch_x)
             loss = criterion(outputs, batch_y)
@@ -202,114 +175,79 @@ def main(args):
             test_mae = (test_mae * i + mae.detach()) / (i + 1)
             mse = ((outputs - batch_y) ** 2).mean()
             test_mse = (test_mse * i + mse.detach()) / (i + 1)
-            pbar.set_description(('%-10.8g' * 1) % (test_mloss))
+            pbar_test.set_description(('%-10.8g' * 1) % (test_mloss))
 
     print(f"测试损失: {test_mloss.item()}, 测试MSE: {test_mse.item()}, 测试MAE: {test_mae.item()}")
 
-    # 保存测试结果
     save_test_results(args, test_mse.item(), test_mae.item())
-
-    # 保存模型信息
     save_model_info(model, save_directory)
 
 
 def save_test_results(args, test_mse, test_mae):
-    """
-    保存测试结果到txt文件
-    """
-    # 从数据路径中提取数据集名称
     data_path = Path(args.data)
     dataset_name = data_path.stem
-
-    # 创建results目录
     results_dir = Path("results")
     results_dir.mkdir(exist_ok=True)
-
-    # 构建结果文件名
     result_filename = f"{dataset_name}_pa_hyperlinear_results.txt"
     result_filepath = results_dir / result_filename
-
-    # 构建模型配置信息字符串
     model_config = (
         f"PAHyperLinear_{dataset_name}_M_ft{args.seq_len}_sl{args.seq_len}_ll{args.pred_len}_"
         f"k{args.k_periods}_dm{args.d_model}_dr{args.dropout}_"
         f"gdd{args.gdd_reduction}_fc{args.feature_type}"
     )
-
-    # 准备结果内容
     result_content = (
         f"{dataset_name}_{args.seq_len}_{args.pred_len}_{model_config}\n"
-        f"mse:{test_mse:.8f}, mae:{test_mae:.8f}\n\n"
+        f"mse:{test_mse}, mae:{test_mae}\n\n"
     )
-
-    # 追加写入文件
     with open(result_filepath, 'a', encoding='utf-8') as f:
         f.write(result_content)
-
     print(f"测试结果已保存到: {result_filepath}")
 
 
 def save_model_info(model, save_directory):
-    """
-    保存模型详细信息
-    """
     model_info = model.get_model_info()
     info_path = os.path.join(save_directory, "model_info.txt")
-
     with open(info_path, 'w', encoding='utf-8') as f:
         f.write("PA-HyperLinear模型信息\n")
         f.write("=" * 50 + "\n")
         for key, value in model_info.items():
             f.write(f"{key}: {value}\n")
-
     print(f"模型信息已保存到: {info_path}")
 
 
 def infer_extension(dataset_name):
-    """推断数据文件扩展名"""
     if dataset_name.startswith('solar'):
-        extension = 'txt'
+        return 'txt'
     elif dataset_name.startswith('PEMS'):
-        extension = 'npz'
+        return 'npz'
     else:
-        extension = 'csv'
-    return extension
+        return 'csv'
 
 
 def parse_args():
     dataset = "ETTh1"
     parser = argparse.ArgumentParser(description='PA-HyperLinear时间序列预测模型')
 
-    # 基础配置
     parser.add_argument('--seed', type=int, default=2025, help='随机种子')
-
-    # 数据加载器
-    parser.add_argument('--data', type=str,
-                        default=ROOT / f'./data/{dataset}.{infer_extension(dataset)}',
+    parser.add_argument('--data', type=str, default=ROOT / f'./data/{dataset}.{infer_extension(dataset)}',
                         help='数据集路径')
-    parser.add_argument('--feature_type', type=str, default='M',
-                        choices=['S', 'M', 'MS'], help='预测任务类型')
+    parser.add_argument('--feature_type', type=str, default='M', choices=['S', 'M', 'MS'], help='预测任务类型')
     parser.add_argument('--target', type=str, default='OT', help='目标特征')
-    parser.add_argument('--checkpoint_dir', type=str, default=ROOT / 'checkpoints',
-                        help='模型检查点位置')
-    parser.add_argument('--name', type=str, default=f'{dataset}',
-                        help='保存最佳模型到 checkpoints/name')
-
-    # 预测任务
+    parser.add_argument('--checkpoint_dir', type=str, default=ROOT / 'checkpoints', help='模型检查点位置')
+    parser.add_argument('--name', type=str, default=f'{dataset}', help='保存最佳模型到 checkpoints/name')
     parser.add_argument('--seq_len', type=int, default=96, help='输入序列长度')
     parser.add_argument('--pred_len', type=int, default=96, help='预测序列长度')
-
-    # PA-HyperLinear 特有参数
     parser.add_argument('--k_periods', type=int, default=3, help='周期数量')
     parser.add_argument('--d_model', type=int, default=512, help='模型维度')
-    parser.add_argument('--gdd_reduction', type=int, default=2,
-                        help='GDD-MLP中间层压缩比例')
+    parser.add_argument('--gdd_reduction', type=int, default=2, help='GDD-MLP中间层压缩比例')
     parser.add_argument('--dropout', type=float, default=0.1, help='dropout率')
-
-    # 优化
     parser.add_argument('--train_epochs', type=int, default=10, help='训练轮次')
     parser.add_argument('--batch_size', type=int, default=128, help='批次大小')
     parser.add_argument('--learning_rate', type=float, default=0.00005, help='学习率')
+
+    # --- 新增早停参数 ---
+    parser.add_argument('--patience', type=int, default=5, help='早停的耐心轮次')
+    # --------------------
 
     args = parser.parse_args()
     return args
