@@ -27,26 +27,50 @@ class RLinearBlock(nn.Module):
         # 核心线性映射层 (通道独立)
         self.linear = nn.Linear(patch_len, d_model)
 
+    # def forward(self, x: torch.Tensor) -> torch.Tensor:
+    #     """
+    #     前向传播：时序特征提取
+    #
+    #     Args:
+    #         x: 输入张量 [Batch, Num_patches, Patch_len, Channels]
+    #
+    #     Returns:
+    #         output: 输出张量 [Batch, Num_patches, d_model, Channels]
+    #     """
+    #     # 1. RevIN 归一化
+    #     x_norm = self.revin(x, mode='norm')
+    #
+    #     # 2. 线性映射 patch_len -> d_model
+    #     # [B, N, P, C] -> [B, N, d_model, C]
+    #     x_mapped = self.linear(x_norm)
+    #
+    #     # 3. RevIN 反归一化
+    #     output = self.revin(x_mapped, mode='denorm')
+    #
+    #     return output
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        前向传播：时序特征提取
+        # 输入 x 的接口形状是: [Batch, Num_patches, Patch_len, Channels]
+        # 例如: [128, 8, 12, 7]
 
-        Args:
-            x: 输入张量 [Batch, Num_patches, Patch_len, Channels]
-
-        Returns:
-            output: 输出张量 [Batch, Num_patches, d_model, Channels]
-        """
-        # 1. RevIN 归一化
         x_norm = self.revin(x, mode='norm')
+        # x_norm 形状不变: [128, 8, 12, 7]
 
-        # 2. 线性映射 patch_len -> d_model
-        # [B, N, P, C] -> [B, N, d_model, C]
-        x_mapped = self.linear(x_norm)
+        # 1. 【维度交换】为了让 linear 作用于 Patch_len 维度
+        # [128, 8, 12, 7] -> [128, 8, 7, 12]
+        x_norm_permuted = x_norm.permute(0, 1, 3, 2)
 
-        # 3. RevIN 反归一化
+        # 2. 【线性映射】现在 linear(12, 128) 可以正确处理最后一个维度 (12)
+        # [128, 8, 7, 12] -> [128, 8, 7, 128]
+        x_mapped_permuted = self.linear(x_norm_permuted)
+
+        # 3. 【恢复维度】将 d_model 和 Channels 维度换回来
+        # [128, 8, 7, 128] -> [128, 8, 128, 7]
+        x_mapped = x_mapped_permuted.permute(0, 1, 3, 2)
+
         output = self.revin(x_mapped, mode='denorm')
+        # output 形状不变: [128, 8, 128, 7]
 
+        # 返回的 output 接口形状是: [Batch, Num_patches, d_model, Channels]
         return output
 
     def extra_repr(self) -> str:
